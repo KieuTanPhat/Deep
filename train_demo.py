@@ -10,6 +10,7 @@ os.environ.setdefault("ABSL_CPP_MIN_LOG_LEVEL", "3")
 
 import numpy as np
 import torch
+from torch.cuda.amp import GradScaler, autocast
 from sklearn import metrics
 from torch.utils.tensorboard import SummaryWriter
 
@@ -38,7 +39,16 @@ def _build_model(name: str):
     raise ValueError(f"Unsupported model: {name}")
 
 
-def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train"):
+def _run_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer=None,
+    device="cpu",
+    phase="train",
+    scaler=None,
+    use_amp=False,
+):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
@@ -60,14 +70,21 @@ def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="tr
             label = label.to(device)
 
         if is_train:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(is_train):
-            output = model(images)
-            loss = criterion(output, label)
+            with autocast(enabled=bool(use_amp and device != "cpu")):
+                output = model(images)
+                loss = criterion(output, label)
+
             if is_train:
-                loss.backward()
-                optimizer.step()
+                if scaler is not None and bool(use_amp and device != "cpu"):
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
         losses.append(loss.item())
 
@@ -243,6 +260,7 @@ def train(
     data_root: str = "data",
     labels_root: str = "labels",
     pretrained_dir: str = PRETRAINED_DIR,
+    amp: bool = True,
 ):
     save_folder = os.path.join("weights", config["task"])
     os.makedirs(save_folder, exist_ok=True)
@@ -293,6 +311,10 @@ def train(
     epochs_no_improve = 0
 
     did_resume = False
+    use_amp = bool(amp and device == "cuda")
+    scaler = GradScaler(enabled=use_amp)
+    print(f"AMP enabled: {use_amp}")
+
     if resume and os.path.exists(last_model_path):
         print(f"Found checkpoint at {last_model_path}. Loading...")
         checkpoint = torch.load(last_model_path, map_location=device)
@@ -335,10 +357,24 @@ def train(
         epoch_start_time = time.time()
 
         train_loss, train_auc, train_acc, _, _, _ = _run_epoch(
-            model, train_loader, criterion, optimizer=optimizer, device=device, phase="train"
+            model,
+            train_loader,
+            criterion,
+            optimizer=optimizer,
+            device=device,
+            phase="train",
+            scaler=scaler,
+            use_amp=use_amp,
         )
         val_loss, val_auc, val_acc, _, _, _ = _run_epoch(
-            model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
+            model,
+            val_loader,
+            val_criterion,
+            optimizer=None,
+            device=device,
+            phase="val",
+            scaler=scaler,
+            use_amp=use_amp,
         )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -415,7 +451,14 @@ def train(
 
     model.eval()
     _, _, _, y_true, y_prob, y_pred = _run_epoch(
-        model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
+        model,
+        val_loader,
+        val_criterion,
+        optimizer=None,
+        device=device,
+        phase="val",
+        scaler=scaler,
+        use_amp=use_amp,
     )
 
     _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{config['task']}_curves.png"))
@@ -474,6 +517,19 @@ if __name__ == "__main__":
         help="Disable loading last checkpoint and start from pretrained/scratch.",
     )
     parser.add_argument(
+        "--amp",
+        dest="amp",
+        action="store_true",
+        help="Enable AMP mixed precision on CUDA.",
+    )
+    parser.add_argument(
+        "--no-amp",
+        dest="amp",
+        action="store_false",
+        help="Disable AMP mixed precision.",
+    )
+    parser.set_defaults(amp=True)
+    parser.add_argument(
         "--list-pretrained",
         action="store_true",
         help="List available pretrained files in model_pretrained and exit.",
@@ -510,5 +566,6 @@ if __name__ == "__main__":
             data_root=args.data_root,
             labels_root=args.labels_root,
             pretrained_dir=args.pretrained_dir,
+            amp=args.amp,
         )
     print("Training Ended...")
