@@ -21,6 +21,8 @@ try:
 except Exception:
     tqdm = None
 
+PRETRAINED_DIR = "model_pretrained"
+
 
 def _build_model(name: str):
     name = name.lower()
@@ -154,7 +156,40 @@ def _plot_roc(y_true, y_prob, out_path):
     plt.close()
 
 
-def train(config: dict, model_name: str):
+def _resolve_pretrained_path(pretrained_file: str):
+    if not pretrained_file:
+        return None
+
+    if os.path.isabs(pretrained_file) and os.path.exists(pretrained_file):
+        return pretrained_file
+
+    candidate = os.path.join(PRETRAINED_DIR, pretrained_file)
+    if os.path.exists(candidate):
+        return candidate
+
+    return None
+
+
+def _load_pretrained_weights(model, pretrained_path: str, device: str):
+    checkpoint = torch.load(pretrained_path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print(f"Loaded pretrained weights (strict=True) from: {pretrained_path}")
+        return
+    except RuntimeError as exc:
+        print(f"Strict load failed: {exc}")
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(f"Loaded pretrained weights (strict=False) from: {pretrained_path}")
+    if missing:
+        print(f"Missing keys: {len(missing)}")
+    if unexpected:
+        print(f"Unexpected keys: {len(unexpected)}")
+
+
+def train(config: dict, model_name: str, pretrained_file: str = "", resume: bool = True):
     save_folder = os.path.join("weights", config["task"])
     os.makedirs(save_folder, exist_ok=True)
 
@@ -201,7 +236,8 @@ def train(config: dict, model_name: str):
     patience = config.get("patience", 5)
     epochs_no_improve = 0
 
-    if os.path.exists(last_model_path):
+    did_resume = False
+    if resume and os.path.exists(last_model_path):
         print(f"Found checkpoint at {last_model_path}. Loading...")
         checkpoint = torch.load(last_model_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -210,6 +246,19 @@ def train(config: dict, model_name: str):
         starting_epoch = checkpoint.get("epoch", starting_epoch) + 1
         best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
         print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
+        did_resume = True
+
+    if not did_resume:
+        pretrained_path = _resolve_pretrained_path(pretrained_file)
+        if pretrained_file and pretrained_path is None:
+            raise FileNotFoundError(
+                f"Could not find pretrained file '{pretrained_file}'. "
+                f"Expected absolute path or file under '{PRETRAINED_DIR}'."
+            )
+        if pretrained_path is not None:
+            _load_pretrained_weights(model, pretrained_path, device)
+        else:
+            print("No checkpoint/pretrained selected. Training from scratch.")
 
     writer = SummaryWriter(comment=f"model={model_name} lr={config['lr']} task={config['task']}")
     t_start_training = time.time()
@@ -336,7 +385,42 @@ if __name__ == "__main__":
         default="abnormal,acl,meniscus",
         help="Comma-separated tasks to train (default: abnormal,acl,meniscus)",
     )
+    parser.add_argument(
+        "--pretrained-file",
+        type=str,
+        default="",
+        help=(
+            "Pretrained .pth file to load. "
+            "Can be an absolute path or filename inside model_pretrained."
+        ),
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable loading last checkpoint and start from pretrained/scratch.",
+    )
+    parser.add_argument(
+        "--list-pretrained",
+        action="store_true",
+        help="List available pretrained files in model_pretrained and exit.",
+    )
     args = parser.parse_args()
+
+    if args.list_pretrained:
+        print(f"Available pretrained files in '{PRETRAINED_DIR}':")
+        if not os.path.exists(PRETRAINED_DIR):
+            print("(folder not found)")
+        else:
+            files = sorted(
+                f for f in os.listdir(PRETRAINED_DIR)
+                if os.path.isfile(os.path.join(PRETRAINED_DIR, f))
+            )
+            if not files:
+                print("(no files)")
+            else:
+                for f in files:
+                    print(f"- {f}")
+        raise SystemExit(0)
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     for task in tasks:
@@ -344,5 +428,10 @@ if __name__ == "__main__":
         cfg["task"] = task
         print("Training Configuration")
         print(cfg)
-        train(config=cfg, model_name=args.model)
+        train(
+            config=cfg,
+            model_name=args.model,
+            pretrained_file=args.pretrained_file,
+            resume=not args.no_resume,
+        )
     print("Training Ended...")
