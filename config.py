@@ -13,5 +13,5 @@ config = {
     # Colab-friendly defaults to reduce GPU memory
     'image_size' : 224,
     'target_slices' : 24,
-    'num_workers' : 4
+    'num_workers' : 2
 }
