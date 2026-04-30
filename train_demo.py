@@ -87,17 +87,54 @@ def _run_epoch(
         y_true.extend(labels)
 
     if len(losses) == 0:
-        return 0.0, 0.5, 0.0, [], [], []
+        return 0.0, [], []
 
+    loss_mean = float(np.mean(losses))
+    return loss_mean, y_true, y_prob
+
+
+def _compute_metrics(y_true, y_prob, threshold=0.5):
+    if len(y_true) == 0:
+        return {
+            "auc": 0.5,
+            "acc": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "threshold": float(threshold),
+            "y_pred": [],
+        }
+
+    y_pred = [1 if p >= threshold else 0 for p in y_prob]
     try:
         auc = metrics.roc_auc_score(y_true, y_prob)
     except Exception:
         auc = 0.5
 
-    y_pred = [1 if p >= 0.5 else 0 for p in y_prob]
-    acc = metrics.accuracy_score(y_true, y_pred)
-    loss_mean = float(np.mean(losses))
-    return loss_mean, float(auc), float(acc), y_true, y_prob, y_pred
+    return {
+        "auc": float(auc),
+        "acc": float(metrics.accuracy_score(y_true, y_pred)),
+        "precision": float(metrics.precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(metrics.recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(metrics.f1_score(y_true, y_pred, zero_division=0)),
+        "threshold": float(threshold),
+        "y_pred": y_pred,
+    }
+
+
+def _find_best_threshold_by_f1(y_true, y_prob, num_thresholds=101):
+    if len(y_true) == 0 or len(set(y_true)) < 2:
+        return 0.5, 0.0
+
+    best_threshold = 0.5
+    best_f1 = -1.0
+    thresholds = np.linspace(0.0, 1.0, num=num_thresholds)
+    for threshold in thresholds:
+        score = metrics.f1_score(y_true, [1 if p >= threshold else 0 for p in y_prob], zero_division=0)
+        if score > best_f1:
+            best_f1 = score
+            best_threshold = float(threshold)
+    return best_threshold, float(best_f1)
 
 
 def _append_csv(csv_path, row, header):
@@ -108,6 +145,21 @@ def _append_csv(csv_path, row, header):
         if not exists:
             writer.writerow(header)
         writer.writerow(row)
+
+
+def _ensure_csv_header(csv_path, header):
+    if not os.path.exists(csv_path):
+        return
+    with open(csv_path, "r", encoding="utf-8") as f:
+        first_line = f.readline().strip()
+    if not first_line:
+        return
+    existing_header = first_line.split(",")
+    if existing_header == header:
+        return
+    backup_path = f"{csv_path}.bak_{int(time.time())}"
+    os.replace(csv_path, backup_path)
+    print(f"Detected old metrics CSV format. Backed up to: {backup_path}")
 
 
 def _plot_curves(csv_path, out_path):
@@ -182,7 +234,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
     last_model_path = os.path.join(save_folder, f"{model_name}_last_checkpoint.pth")
 
     print("Starting to Train Model...")
-    train_loader, val_loader, train_wts, val_wts = load_data(
+    train_loader, val_loader, test_loader, train_wts, val_wts, test_wts = load_data(
         config["task"],
         batch_size=config["batch_size"],
         num_workers=config["num_workers"],
@@ -190,6 +242,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         image_size=config["image_size"],
         data_root=data_root,
         label_root=labels_root,
+        include_test=True,
     )
 
     print("Initializing Model...")
@@ -199,13 +252,18 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         model = model.cuda()
         train_wts = train_wts.cuda()
         val_wts = val_wts.cuda()
+        if test_wts is not None:
+            test_wts = test_wts.cuda()
 
     print("Initializing Loss Method...")
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=train_wts)
     val_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=val_wts)
+    test_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=test_wts) if test_wts is not None else val_criterion
     if device == "cuda":
         criterion = criterion.cuda()
         val_criterion = val_criterion.cuda()
+        if test_wts is not None:
+            test_criterion = test_criterion.cuda()
 
     print("Setup the Optimizer")
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
@@ -240,17 +298,29 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         "train_loss",
         "train_auc",
         "train_acc",
+        "train_precision",
+        "train_recall",
+        "train_f1",
         "val_loss",
         "val_auc",
         "val_acc",
+        "val_precision",
+        "val_recall",
+        "val_f1",
+        "val_best_threshold",
+        "val_best_f1",
+        "val_best_precision",
+        "val_best_recall",
+        "val_best_acc",
         "lr",
     ]
+    _ensure_csv_header(csv_path, header)
 
     for epoch in range(starting_epoch, num_epochs):
         current_lr = _get_lr(optimizer)
         epoch_start_time = time.time()
 
-        train_loss, train_auc, train_acc, _, _, _ = _run_epoch(
+        train_loss, train_true, train_prob = _run_epoch(
             model,
             train_loader,
             criterion,
@@ -260,7 +330,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
             scaler=scaler,
             use_amp=use_amp,
         )
-        val_loss, val_auc, val_acc, _, _, _ = _run_epoch(
+        val_loss, val_true, val_prob = _run_epoch(
             model,
             val_loader,
             val_criterion,
@@ -271,12 +341,25 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
             use_amp=use_amp,
         )
 
+        train_metrics = _compute_metrics(train_true, train_prob, threshold=0.5)
+        val_metrics = _compute_metrics(val_true, val_prob, threshold=0.5)
+        val_best_threshold, _ = _find_best_threshold_by_f1(val_true, val_prob)
+        val_best_metrics = _compute_metrics(val_true, val_prob, threshold=val_best_threshold)
+
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
-        writer.add_scalar("Train/AUC_epoch", train_auc, epoch)
-        writer.add_scalar("Train/Acc_epoch", train_acc, epoch)
+        writer.add_scalar("Train/AUC_epoch", train_metrics["auc"], epoch)
+        writer.add_scalar("Train/Acc_epoch", train_metrics["acc"], epoch)
+        writer.add_scalar("Train/Precision_epoch", train_metrics["precision"], epoch)
+        writer.add_scalar("Train/Recall_epoch", train_metrics["recall"], epoch)
+        writer.add_scalar("Train/F1_epoch", train_metrics["f1"], epoch)
         writer.add_scalar("Val/Avg Loss", val_loss, epoch)
-        writer.add_scalar("Val/AUC_epoch", val_auc, epoch)
-        writer.add_scalar("Val/Acc_epoch", val_acc, epoch)
+        writer.add_scalar("Val/AUC_epoch", val_metrics["auc"], epoch)
+        writer.add_scalar("Val/Acc_epoch", val_metrics["acc"], epoch)
+        writer.add_scalar("Val/Precision_epoch", val_metrics["precision"], epoch)
+        writer.add_scalar("Val/Recall_epoch", val_metrics["recall"], epoch)
+        writer.add_scalar("Val/F1_epoch", val_metrics["f1"], epoch)
+        writer.add_scalar("Val/BestThreshold_F1", val_best_threshold, epoch)
+        writer.add_scalar("Val/BestF1_epoch", val_best_metrics["f1"], epoch)
 
         scheduler.step(val_loss)
 
@@ -284,8 +367,24 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         delta = t_end - epoch_start_time
         print(
             "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
-            "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | time {:.2f} s".format(
-                epoch, num_epochs, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, delta
+            "train p/r/f1 {:.4f}/{:.4f}/{:.4f} | val loss {:.4f} | val auc {:.4f} | "
+            "val p/r/f1@0.5 {:.4f}/{:.4f}/{:.4f} | val best_thr {:.2f} f1 {:.4f} | time {:.2f} s".format(
+                epoch,
+                num_epochs,
+                train_loss,
+                train_metrics["auc"],
+                train_metrics["acc"],
+                train_metrics["precision"],
+                train_metrics["recall"],
+                train_metrics["f1"],
+                val_loss,
+                val_metrics["auc"],
+                val_metrics["precision"],
+                val_metrics["recall"],
+                val_metrics["f1"],
+                val_best_threshold,
+                val_best_metrics["f1"],
+                delta,
             )
         )
         print("-" * 30)
@@ -293,13 +392,33 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
 
         _append_csv(
             csv_path,
-            [epoch, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, current_lr],
+            [
+                epoch,
+                train_loss,
+                train_metrics["auc"],
+                train_metrics["acc"],
+                train_metrics["precision"],
+                train_metrics["recall"],
+                train_metrics["f1"],
+                val_loss,
+                val_metrics["auc"],
+                val_metrics["acc"],
+                val_metrics["precision"],
+                val_metrics["recall"],
+                val_metrics["f1"],
+                val_best_threshold,
+                val_best_metrics["f1"],
+                val_best_metrics["precision"],
+                val_best_metrics["recall"],
+                val_best_metrics["acc"],
+                current_lr,
+            ],
             header,
         )
 
-        improved = val_auc > best_val_auc
+        improved = val_metrics["auc"] > best_val_auc
         if improved:
-            best_val_auc = val_auc
+            best_val_auc = val_metrics["auc"]
             epochs_no_improve = 0
             print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
             torch.save(
@@ -344,7 +463,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         model.load_state_dict(checkpoint["model_state_dict"])
 
     model.eval()
-    _, _, _, y_true, y_prob, y_pred = _run_epoch(
+    _, val_true, val_prob = _run_epoch(
         model,
         val_loader,
         val_criterion,
@@ -355,11 +474,75 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         use_amp=use_amp,
     )
 
+    best_threshold, _ = _find_best_threshold_by_f1(val_true, val_prob)
+    val_final_metrics = _compute_metrics(val_true, val_prob, threshold=best_threshold)
+    print(
+        "Final VALID metrics | thr {:.2f} | auc {:.4f} | acc {:.4f} | precision {:.4f} | recall {:.4f} | f1 {:.4f}".format(
+            best_threshold,
+            val_final_metrics["auc"],
+            val_final_metrics["acc"],
+            val_final_metrics["precision"],
+            val_final_metrics["recall"],
+            val_final_metrics["f1"],
+        )
+    )
+
     _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{config['task']}_curves.png"))
-    _plot_confusion_matrix(y_true, y_pred, os.path.join(eval_folder, f"{model_name}_{config['task']}_confusion.png"))
-    _plot_roc(y_true, y_prob, os.path.join(eval_folder, f"{model_name}_{config['task']}_roc.png"))
+    _plot_confusion_matrix(
+        val_true,
+        val_final_metrics["y_pred"],
+        os.path.join(eval_folder, f"{model_name}_{config['task']}_confusion.png"),
+    )
+    _plot_roc(val_true, val_prob, os.path.join(eval_folder, f"{model_name}_{config['task']}_roc.png"))
+
+    test_metrics_csv = os.path.join(eval_folder, f"{model_name}_{config['task']}_test_metrics.csv")
+    if test_loader is not None:
+        _, test_true, test_prob = _run_epoch(
+            model,
+            test_loader,
+            test_criterion,
+            optimizer=None,
+            device=device,
+            phase="test",
+            scaler=scaler,
+            use_amp=use_amp,
+        )
+        test_metrics = _compute_metrics(test_true, test_prob, threshold=best_threshold)
+        print(
+            "Final TEST metrics  | thr {:.2f} | auc {:.4f} | acc {:.4f} | precision {:.4f} | recall {:.4f} | f1 {:.4f}".format(
+                best_threshold,
+                test_metrics["auc"],
+                test_metrics["acc"],
+                test_metrics["precision"],
+                test_metrics["recall"],
+                test_metrics["f1"],
+            )
+        )
+        _append_csv(
+            test_metrics_csv,
+            [
+                config["task"],
+                best_threshold,
+                test_metrics["auc"],
+                test_metrics["acc"],
+                test_metrics["precision"],
+                test_metrics["recall"],
+                test_metrics["f1"],
+            ],
+            ["task", "threshold", "auc", "acc", "precision", "recall", "f1"],
+        )
+        _plot_confusion_matrix(
+            test_true,
+            test_metrics["y_pred"],
+            os.path.join(eval_folder, f"{model_name}_{config['task']}_test_confusion.png"),
+        )
+        _plot_roc(test_true, test_prob, os.path.join(eval_folder, f"{model_name}_{config['task']}_test_roc.png"))
+    else:
+        print("Skip TEST evaluation: test split not found.")
 
     print(f"Metrics saved to: {csv_path}")
+    if test_loader is not None:
+        print(f"Test metrics saved to: {test_metrics_csv}")
     print(f"Plots saved to: {eval_folder}")
 
 
@@ -382,13 +565,13 @@ if __name__ == "__main__":
         "--data-root",
         type=str,
         default="data",
-        help="Directory containing train/valid MRI folders (default: ./data).",
+        help="Directory containing train/valid/test MRI folders (default: ./data).",
     )
     parser.add_argument(
         "--labels-root",
         type=str,
         default="labels",
-        help="Directory containing train-*.csv and valid-*.csv (default: ./labels).",
+        help="Directory containing train-*.csv, valid-*.csv and test-*.csv (default: ./labels).",
     )
     args = parser.parse_args()
 

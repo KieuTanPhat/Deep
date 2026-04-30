@@ -20,6 +20,7 @@ class MRData(data.Dataset):
         self,
         task='acl',
         train=True,
+        split=None,
         transform=None,
         weights=None,
         target_slices=32,
@@ -33,27 +34,27 @@ class MRData(data.Dataset):
         self.image_path = {}
         self.target_slices = target_slices
         self.input_dim = input_dim
-        self.train = train
+        if split is None:
+            split = 'train' if train else 'valid'
+        split = split.lower()
+        if split not in {'train', 'valid', 'test'}:
+            raise ValueError(f"Unsupported split: {split}")
+
+        self.split = split
+        self.train = split == 'train'
         self.data_root = data_root
         self.label_root = label_root
 
-        if train:
-            self.records = pd.read_csv(
-                os.path.join(self.label_root, 'train-{}.csv'.format(task)),
-                header=None,
-                names=['id', 'label']
-            )
-            for plane in self.planes:
-                self.image_path[plane] = os.path.join(self.data_root, 'train', plane)
-        else:
+        if not self.train:
             transform = None
-            self.records = pd.read_csv(
-                os.path.join(self.label_root, 'valid-{}.csv'.format(task)),
-                header=None,
-                names=['id', 'label']
-            )
-            for plane in self.planes:
-                self.image_path[plane] = os.path.join(self.data_root, 'valid', plane)
+
+        self.records = pd.read_csv(
+            os.path.join(self.label_root, f'{self.split}-{task}.csv'),
+            header=None,
+            names=['id', 'label']
+        )
+        for plane in self.planes:
+            self.image_path[plane] = os.path.join(self.data_root, self.split, plane)
 
         self.transform = transform
         self.records['id'] = self.records['id'].map(lambda i: '0' * (4 - len(str(i))) + str(i))
@@ -75,7 +76,7 @@ class MRData(data.Dataset):
         else:
             self.weights = torch.FloatTensor([neg / pos])
         
-        print(f'Task: {task} | Train: {train}')
+        print(f'Task: {task} | Split: {self.split}')
         print(f'Samples: -ve: {neg}, +ve: {pos} | Loss Weights: {self.weights}')
 
     def __len__(self):
@@ -132,6 +133,7 @@ def load_data(
     image_size: int = INPUT_DIM,
     data_root: str = './data',
     label_root: str = './labels',
+    include_test: bool = False,
 ):
     # ?????nh ngh??a Augmentation
     # L??u ??: Kh??ng c???n b?????c repeat/permute n???a v?? ???? l??m trong _resize_image
@@ -145,6 +147,7 @@ def load_data(
     train_data = MRData(
         task,
         train=True,
+        split='train',
         transform=augments,
         target_slices=target_slices,
         input_dim=image_size,
@@ -164,6 +167,7 @@ def load_data(
     val_data = MRData(
         task,
         train=False,
+        split='valid',
         target_slices=target_slices,
         input_dim=image_size,
         data_root=data_root,
@@ -171,4 +175,25 @@ def load_data(
     )
     val_loader = data.DataLoader(val_data, batch_size=batch_size, num_workers=num_workers, shuffle=False)
 
-    return train_loader, val_loader, train_data.weights, val_data.weights
+    if not include_test:
+        return train_loader, val_loader, train_data.weights, val_data.weights
+
+    test_label_path = os.path.join(label_root, f'test-{task}.csv')
+    test_data_path = os.path.join(data_root, 'test')
+    if not (os.path.exists(test_label_path) and os.path.isdir(test_data_path)):
+        print(f"Warning: test split not found for task={task}. Skip loading test set.")
+        return train_loader, val_loader, None, train_data.weights, val_data.weights, None
+
+    print('Loading Test Dataset of {} task...'.format(task))
+    test_data = MRData(
+        task,
+        train=False,
+        split='test',
+        target_slices=target_slices,
+        input_dim=image_size,
+        data_root=data_root,
+        label_root=label_root,
+    )
+    test_loader = data.DataLoader(test_data, batch_size=batch_size, num_workers=num_workers, shuffle=False)
+
+    return train_loader, val_loader, test_loader, train_data.weights, val_data.weights, test_data.weights
