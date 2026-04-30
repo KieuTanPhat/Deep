@@ -11,7 +11,7 @@ config = {
     'save_model' : 1,
     'exp_name' : 'test',
     # Colab-friendly defaults to reduce GPU memory
-    'image_size' : 224,
+    'image_size' : 160,
     'target_slices' : 21,
     'num_workers' : 2
 }
