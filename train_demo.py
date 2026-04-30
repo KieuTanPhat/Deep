@@ -3,6 +3,11 @@ import csv
 import os
 import time
 
+# Silence TensorFlow/XLA C++ logs that may appear via tensorboard deps on Kaggle.
+# Must be set before importing torch/tensorboard-related modules.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("ABSL_CPP_MIN_LOG_LEVEL", "3")
+
 import numpy as np
 import torch
 from sklearn import metrics
@@ -170,9 +175,37 @@ def _resolve_pretrained_path(pretrained_file: str, pretrained_dir: str):
     return None
 
 
+def _strip_module_prefix(state_dict):
+    if not isinstance(state_dict, dict):
+        return state_dict
+    if not any(k.startswith("module.") for k in state_dict.keys()):
+        return state_dict
+    return {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
+
+
+def _convert_n5_shared_backbone_to_three_planes(state_dict, model):
+    model_state = model.state_dict()
+    converted = {}
+
+    for key, value in state_dict.items():
+        if key.startswith("backbone."):
+            suffix = key[len("backbone."):]
+            for plane in ("axial", "coronal", "sagittal"):
+                target_key = f"{plane}.{suffix}"
+                if target_key in model_state and hasattr(value, "shape") and model_state[target_key].shape == value.shape:
+                    converted[target_key] = value
+            continue
+
+        if key in model_state and hasattr(value, "shape") and model_state[key].shape == value.shape:
+            converted[key] = value
+
+    return converted
+
+
 def _load_pretrained_weights(model, pretrained_path: str, device: str):
     checkpoint = torch.load(pretrained_path, map_location=device)
-    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    state_dict = checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint)) if isinstance(checkpoint, dict) else checkpoint
+    state_dict = _strip_module_prefix(state_dict)
 
     try:
         model.load_state_dict(state_dict, strict=True)
@@ -180,6 +213,19 @@ def _load_pretrained_weights(model, pretrained_path: str, device: str):
         return
     except RuntimeError as exc:
         print(f"Strict load failed: {exc}")
+
+    has_shared_backbone = isinstance(state_dict, dict) and any(k.startswith("backbone.") for k in state_dict.keys())
+    if has_shared_backbone:
+        converted_state_dict = _convert_n5_shared_backbone_to_three_planes(state_dict, model)
+        if len(converted_state_dict) > 0:
+            missing, unexpected = model.load_state_dict(converted_state_dict, strict=False)
+            print(f"Loaded converted N5 pretrained weights from: {pretrained_path}")
+            print(f"Converted tensors: {len(converted_state_dict)}")
+            if missing:
+                print(f"Missing keys: {len(missing)}")
+            if unexpected:
+                print(f"Unexpected keys: {len(unexpected)}")
+            return
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"Loaded pretrained weights (strict=False) from: {pretrained_path}")
