@@ -48,9 +48,11 @@ def _run_epoch(
     phase="train",
     scaler=None,
     use_amp=False,
+    grad_accum_steps=1,
 ):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
+    grad_accum_steps = max(1, int(grad_accum_steps))
 
     y_true = []
     y_prob = []
@@ -60,7 +62,11 @@ def _run_epoch(
     if tqdm is not None:
         iterator = tqdm(loader, desc=phase, leave=False)
 
-    for batch in iterator:
+    total_steps = len(loader)
+    if is_train:
+        optimizer.zero_grad(set_to_none=True)
+
+    for step_idx, batch in enumerate(iterator):
         if batch is None:
             continue
         images, label = batch
@@ -69,22 +75,25 @@ def _run_epoch(
             images = [img.to(device) for img in images]
             label = label.to(device)
 
-        if is_train:
-            optimizer.zero_grad(set_to_none=True)
-
         with torch.set_grad_enabled(is_train):
             with autocast(enabled=bool(use_amp and device != "cpu")):
                 output = model(images)
                 loss = criterion(output, label)
 
             if is_train:
+                loss_for_backward = loss / grad_accum_steps
+                should_step = ((step_idx + 1) % grad_accum_steps == 0) or ((step_idx + 1) == total_steps)
                 if scaler is not None and bool(use_amp and device != "cpu"):
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                    scaler.scale(loss_for_backward).backward()
+                    if should_step:
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
                 else:
-                    loss.backward()
-                    optimizer.step()
+                    loss_for_backward.backward()
+                    if should_step:
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
 
         losses.append(loss.item())
 
@@ -261,6 +270,7 @@ def train(
     labels_root: str = "labels",
     pretrained_dir: str = PRETRAINED_DIR,
     amp: bool = True,
+    grad_accum_steps: int = 1,
 ):
     save_folder = os.path.join("weights", config["task"])
     os.makedirs(save_folder, exist_ok=True)
@@ -314,6 +324,8 @@ def train(
     use_amp = bool(amp and device == "cuda")
     scaler = GradScaler(enabled=use_amp)
     print(f"AMP enabled: {use_amp}")
+    print(f"Gradient accumulation steps: {max(1, int(grad_accum_steps))}")
+    print(f"Effective batch size: {config['batch_size'] * max(1, int(grad_accum_steps))}")
 
     if resume and os.path.exists(last_model_path):
         print(f"Found checkpoint at {last_model_path}. Loading...")
@@ -365,6 +377,7 @@ def train(
             phase="train",
             scaler=scaler,
             use_amp=use_amp,
+            grad_accum_steps=grad_accum_steps,
         )
         val_loss, val_auc, val_acc, _, _, _ = _run_epoch(
             model,
@@ -375,6 +388,7 @@ def train(
             phase="val",
             scaler=scaler,
             use_amp=use_amp,
+            grad_accum_steps=1,
         )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -459,6 +473,7 @@ def train(
         phase="val",
         scaler=scaler,
         use_amp=use_amp,
+        grad_accum_steps=1,
     )
 
     _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{config['task']}_curves.png"))
@@ -530,6 +545,12 @@ if __name__ == "__main__":
     )
     parser.set_defaults(amp=True)
     parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Number of steps to accumulate gradients before optimizer step.",
+    )
+    parser.add_argument(
         "--list-pretrained",
         action="store_true",
         help="List available pretrained files in model_pretrained and exit.",
@@ -567,5 +588,6 @@ if __name__ == "__main__":
             labels_root=args.labels_root,
             pretrained_dir=args.pretrained_dir,
             amp=args.amp,
+            grad_accum_steps=args.grad_accum_steps,
         )
     print("Training Ended...")
