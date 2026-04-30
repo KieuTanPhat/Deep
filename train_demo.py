@@ -156,14 +156,14 @@ def _plot_roc(y_true, y_prob, out_path):
     plt.close()
 
 
-def _resolve_pretrained_path(pretrained_file: str):
+def _resolve_pretrained_path(pretrained_file: str, pretrained_dir: str):
     if not pretrained_file:
         return None
 
     if os.path.isabs(pretrained_file) and os.path.exists(pretrained_file):
         return pretrained_file
 
-    candidate = os.path.join(PRETRAINED_DIR, pretrained_file)
+    candidate = os.path.join(pretrained_dir, pretrained_file)
     if os.path.exists(candidate):
         return candidate
 
@@ -189,7 +189,15 @@ def _load_pretrained_weights(model, pretrained_path: str, device: str):
         print(f"Unexpected keys: {len(unexpected)}")
 
 
-def train(config: dict, model_name: str, pretrained_file: str = "", resume: bool = True):
+def train(
+    config: dict,
+    model_name: str,
+    pretrained_file: str = "",
+    resume: bool = True,
+    data_root: str = "data",
+    labels_root: str = "labels",
+    pretrained_dir: str = PRETRAINED_DIR,
+):
     save_folder = os.path.join("weights", config["task"])
     os.makedirs(save_folder, exist_ok=True)
 
@@ -207,6 +215,8 @@ def train(config: dict, model_name: str, pretrained_file: str = "", resume: bool
         num_workers=config["num_workers"],
         target_slices=config["target_slices"],
         image_size=config["image_size"],
+        data_root=data_root,
+        label_root=labels_root,
     )
 
     print("Initializing Model...")
@@ -249,11 +259,11 @@ def train(config: dict, model_name: str, pretrained_file: str = "", resume: bool
         did_resume = True
 
     if not did_resume:
-        pretrained_path = _resolve_pretrained_path(pretrained_file)
+        pretrained_path = _resolve_pretrained_path(pretrained_file, pretrained_dir=pretrained_dir)
         if pretrained_file and pretrained_path is None:
             raise FileNotFoundError(
                 f"Could not find pretrained file '{pretrained_file}'. "
-                f"Expected absolute path or file under '{PRETRAINED_DIR}'."
+                f"Expected absolute path or file under '{pretrained_dir}'."
             )
         if pretrained_path is not None:
             _load_pretrained_weights(model, pretrained_path, device)
@@ -395,6 +405,24 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--pretrained-dir",
+        type=str,
+        default=PRETRAINED_DIR,
+        help="Directory containing pretrained files (default: model_pretrained).",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default="data",
+        help="Directory containing train/valid MRI folders (default: ./data).",
+    )
+    parser.add_argument(
+        "--labels-root",
+        type=str,
+        default="labels",
+        help="Directory containing train-*.csv and valid-*.csv (default: ./labels).",
+    )
+    parser.add_argument(
         "--no-resume",
         action="store_true",
         help="Disable loading last checkpoint and start from pretrained/scratch.",
@@ -407,13 +435,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.list_pretrained:
-        print(f"Available pretrained files in '{PRETRAINED_DIR}':")
-        if not os.path.exists(PRETRAINED_DIR):
+        print(f"Available pretrained files in '{args.pretrained_dir}':")
+        if not os.path.exists(args.pretrained_dir):
             print("(folder not found)")
         else:
             files = sorted(
-                f for f in os.listdir(PRETRAINED_DIR)
-                if os.path.isfile(os.path.join(PRETRAINED_DIR, f))
+                f for f in os.listdir(args.pretrained_dir)
+                if os.path.isfile(os.path.join(args.pretrained_dir, f))
             )
             if not files:
                 print("(no files)")
@@ -433,5 +461,8 @@ if __name__ == "__main__":
             model_name=args.model,
             pretrained_file=args.pretrained_file,
             resume=not args.no_resume,
+            data_root=args.data_root,
+            labels_root=args.labels_root,
+            pretrained_dir=args.pretrained_dir,
         )
     print("Training Ended...")

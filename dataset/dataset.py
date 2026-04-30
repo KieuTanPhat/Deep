@@ -16,7 +16,17 @@ MEAN = 58.09
 STDDEV = 49.73
 
 class MRData(data.Dataset):
-    def __init__(self, task='acl', train=True, transform=None, weights=None, target_slices=32, input_dim=INPUT_DIM):
+    def __init__(
+        self,
+        task='acl',
+        train=True,
+        transform=None,
+        weights=None,
+        target_slices=32,
+        input_dim=INPUT_DIM,
+        data_root='./data',
+        label_root='./labels',
+    ):
         super().__init__()
         self.planes = ['axial', 'coronal', 'sagittal']
         self.records = None
@@ -24,23 +34,36 @@ class MRData(data.Dataset):
         self.target_slices = target_slices
         self.input_dim = input_dim
         self.train = train
+        self.data_root = data_root
+        self.label_root = label_root
 
         if train:
-            self.records = pd.read_csv('./labels/train-{}.csv'.format(task), header=None, names=['id', 'label'])
+            self.records = pd.read_csv(
+                os.path.join(self.label_root, 'train-{}.csv'.format(task)),
+                header=None,
+                names=['id', 'label']
+            )
             for plane in self.planes:
-                self.image_path[plane] = './data/train/{}/'.format(plane)
+                self.image_path[plane] = os.path.join(self.data_root, 'train', plane)
         else:
             transform = None
-            self.records = pd.read_csv('./labels/valid-{}.csv'.format(task), header=None, names=['id', 'label'])
+            self.records = pd.read_csv(
+                os.path.join(self.label_root, 'valid-{}.csv'.format(task)),
+                header=None,
+                names=['id', 'label']
+            )
             for plane in self.planes:
-                self.image_path[plane] = './data/valid/{}/'.format(plane)
+                self.image_path[plane] = os.path.join(self.data_root, 'valid', plane)
 
         self.transform = transform
         self.records['id'] = self.records['id'].map(lambda i: '0' * (4 - len(str(i))) + str(i))
         
         self.paths = {}
         for plane in self.planes:
-            self.paths[plane] = [self.image_path[plane] + filename + '.npy' for filename in self.records['id'].tolist()]
+            self.paths[plane] = [
+                os.path.join(self.image_path[plane], filename + '.npy')
+                for filename in self.records['id'].tolist()
+            ]
 
         self.labels = self.records['label'].tolist()
         
@@ -101,7 +124,15 @@ class MRData(data.Dataset):
 
         return image
 
-def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slices: int = 32, image_size: int = INPUT_DIM):
+def load_data(
+    task: str,
+    batch_size: int = 1,
+    num_workers: int = 0,
+    target_slices: int = 32,
+    image_size: int = INPUT_DIM,
+    data_root: str = './data',
+    label_root: str = './labels',
+):
     # ?????nh ngh??a Augmentation
     # L??u ??: Kh??ng c???n b?????c repeat/permute n???a v?? ???? l??m trong _resize_image
     augments = transforms.Compose([
@@ -111,7 +142,15 @@ def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slice
     ])
 
     print('Loading Train Dataset of {} task...'.format(task))
-    train_data = MRData(task, train=True, transform=augments, target_slices=target_slices, input_dim=image_size)
+    train_data = MRData(
+        task,
+        train=True,
+        transform=augments,
+        target_slices=target_slices,
+        input_dim=image_size,
+        data_root=data_root,
+        label_root=label_root,
+    )
     # Weighted sampling to balance classes in each batch
     labels = train_data.labels
     class_counts = np.bincount(labels)
@@ -122,7 +161,14 @@ def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slice
     train_loader = data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, sampler=sampler)
 
     print('Loading Validation Dataset of {} task...'.format(task))
-    val_data = MRData(task, train=False, target_slices=target_slices, input_dim=image_size)
+    val_data = MRData(
+        task,
+        train=False,
+        target_slices=target_slices,
+        input_dim=image_size,
+        data_root=data_root,
+        label_root=label_root,
+    )
     val_loader = data.DataLoader(val_data, batch_size=batch_size, num_workers=num_workers, shuffle=False)
 
     return train_loader, val_loader, train_data.weights, val_data.weights
