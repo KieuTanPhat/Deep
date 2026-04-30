@@ -154,7 +154,7 @@ def _plot_roc(y_true, y_prob, out_path):
     plt.close()
 
 
-def train(config: dict, model_name: str):
+def train(config: dict, model_name: str, data_root: str = "data", labels_root: str = "labels"):
     save_folder = os.path.join("weights", config["task"])
     os.makedirs(save_folder, exist_ok=True)
 
@@ -172,6 +172,8 @@ def train(config: dict, model_name: str):
         num_workers=config["num_workers"],
         target_slices=config["target_slices"],
         image_size=config["image_size"],
+        data_root=data_root,
+        label_root=labels_root,
     )
 
     print("Initializing Model...")
@@ -336,6 +338,18 @@ if __name__ == "__main__":
         default="abnormal,acl,meniscus",
         help="Comma-separated tasks to train (default: abnormal,acl,meniscus)",
     )
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default="data",
+        help="Directory containing train/valid MRI folders (default: ./data).",
+    )
+    parser.add_argument(
+        "--labels-root",
+        type=str,
+        default="labels",
+        help="Directory containing train-*.csv and valid-*.csv (default: ./labels).",
+    )
     args = parser.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -344,5 +358,10 @@ if __name__ == "__main__":
         cfg["task"] = task
         print("Training Configuration")
         print(cfg)
-        train(config=cfg, model_name=args.model)
+        train(
+            config=cfg,
+            model_name=args.model,
+            data_root=args.data_root,
+            labels_root=args.labels_root,
+        )
     print("Training Ended...")
