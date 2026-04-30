@@ -3,14 +3,8 @@ import csv
 import os
 import time
 
-# Silence TensorFlow/XLA C++ logs that may appear via tensorboard deps on Kaggle.
-# Must be set before importing torch/tensorboard-related modules.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("ABSL_CPP_MIN_LOG_LEVEL", "3")
-
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
 from sklearn import metrics
 from torch.utils.tensorboard import SummaryWriter
 
@@ -27,8 +21,6 @@ try:
 except Exception:
     tqdm = None
 
-PRETRAINED_DIR = "model_pretrained"
-
 
 def _build_model(name: str):
     name = name.lower()
@@ -39,20 +31,9 @@ def _build_model(name: str):
     raise ValueError(f"Unsupported model: {name}")
 
 
-def _run_epoch(
-    model,
-    loader,
-    criterion,
-    optimizer=None,
-    device="cpu",
-    phase="train",
-    scaler=None,
-    use_amp=False,
-    grad_accum_steps=1,
-):
+def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train"):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
-    grad_accum_steps = max(1, int(grad_accum_steps))
 
     y_true = []
     y_prob = []
@@ -62,11 +43,7 @@ def _run_epoch(
     if tqdm is not None:
         iterator = tqdm(loader, desc=phase, leave=False)
 
-    total_steps = len(loader)
-    if is_train:
-        optimizer.zero_grad(set_to_none=True)
-
-    for step_idx, batch in enumerate(iterator):
+    for batch in iterator:
         if batch is None:
             continue
         images, label = batch
@@ -75,25 +52,15 @@ def _run_epoch(
             images = [img.to(device) for img in images]
             label = label.to(device)
 
-        with torch.set_grad_enabled(is_train):
-            with autocast(enabled=bool(use_amp and device != "cpu")):
-                output = model(images)
-                loss = criterion(output, label)
+        if is_train:
+            optimizer.zero_grad()
 
+        with torch.set_grad_enabled(is_train):
+            output = model(images)
+            loss = criterion(output, label)
             if is_train:
-                loss_for_backward = loss / grad_accum_steps
-                should_step = ((step_idx + 1) % grad_accum_steps == 0) or ((step_idx + 1) == total_steps)
-                if scaler is not None and bool(use_amp and device != "cpu"):
-                    scaler.scale(loss_for_backward).backward()
-                    if should_step:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad(set_to_none=True)
-                else:
-                    loss_for_backward.backward()
-                    if should_step:
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
 
         losses.append(loss.item())
 
@@ -187,91 +154,7 @@ def _plot_roc(y_true, y_prob, out_path):
     plt.close()
 
 
-def _resolve_pretrained_path(pretrained_file: str, pretrained_dir: str):
-    if not pretrained_file:
-        return None
-
-    if os.path.isabs(pretrained_file) and os.path.exists(pretrained_file):
-        return pretrained_file
-
-    candidate = os.path.join(pretrained_dir, pretrained_file)
-    if os.path.exists(candidate):
-        return candidate
-
-    return None
-
-
-def _strip_module_prefix(state_dict):
-    if not isinstance(state_dict, dict):
-        return state_dict
-    if not any(k.startswith("module.") for k in state_dict.keys()):
-        return state_dict
-    return {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
-
-
-def _convert_n5_shared_backbone_to_three_planes(state_dict, model):
-    model_state = model.state_dict()
-    converted = {}
-
-    for key, value in state_dict.items():
-        if key.startswith("backbone."):
-            suffix = key[len("backbone."):]
-            for plane in ("axial", "coronal", "sagittal"):
-                target_key = f"{plane}.{suffix}"
-                if target_key in model_state and hasattr(value, "shape") and model_state[target_key].shape == value.shape:
-                    converted[target_key] = value
-            continue
-
-        if key in model_state and hasattr(value, "shape") and model_state[key].shape == value.shape:
-            converted[key] = value
-
-    return converted
-
-
-def _load_pretrained_weights(model, pretrained_path: str, device: str):
-    checkpoint = torch.load(pretrained_path, map_location=device)
-    state_dict = checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint)) if isinstance(checkpoint, dict) else checkpoint
-    state_dict = _strip_module_prefix(state_dict)
-
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print(f"Loaded pretrained weights (strict=True) from: {pretrained_path}")
-        return
-    except RuntimeError as exc:
-        print(f"Strict load failed: {exc}")
-
-    has_shared_backbone = isinstance(state_dict, dict) and any(k.startswith("backbone.") for k in state_dict.keys())
-    if has_shared_backbone:
-        converted_state_dict = _convert_n5_shared_backbone_to_three_planes(state_dict, model)
-        if len(converted_state_dict) > 0:
-            missing, unexpected = model.load_state_dict(converted_state_dict, strict=False)
-            print(f"Loaded converted N5 pretrained weights from: {pretrained_path}")
-            print(f"Converted tensors: {len(converted_state_dict)}")
-            if missing:
-                print(f"Missing keys: {len(missing)}")
-            if unexpected:
-                print(f"Unexpected keys: {len(unexpected)}")
-            return
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"Loaded pretrained weights (strict=False) from: {pretrained_path}")
-    if missing:
-        print(f"Missing keys: {len(missing)}")
-    if unexpected:
-        print(f"Unexpected keys: {len(unexpected)}")
-
-
-def train(
-    config: dict,
-    model_name: str,
-    pretrained_file: str = "",
-    resume: bool = True,
-    data_root: str = "data",
-    labels_root: str = "labels",
-    pretrained_dir: str = PRETRAINED_DIR,
-    amp: bool = True,
-    grad_accum_steps: int = 1,
-):
+def train(config: dict, model_name: str):
     save_folder = os.path.join("weights", config["task"])
     os.makedirs(save_folder, exist_ok=True)
 
@@ -289,8 +172,6 @@ def train(
         num_workers=config["num_workers"],
         target_slices=config["target_slices"],
         image_size=config["image_size"],
-        data_root=data_root,
-        label_root=labels_root,
     )
 
     print("Initializing Model...")
@@ -320,14 +201,7 @@ def train(
     patience = config.get("patience", 5)
     epochs_no_improve = 0
 
-    did_resume = False
-    use_amp = bool(amp and device == "cuda")
-    scaler = GradScaler(enabled=use_amp)
-    print(f"AMP enabled: {use_amp}")
-    print(f"Gradient accumulation steps: {max(1, int(grad_accum_steps))}")
-    print(f"Effective batch size: {config['batch_size'] * max(1, int(grad_accum_steps))}")
-
-    if resume and os.path.exists(last_model_path):
+    if os.path.exists(last_model_path):
         print(f"Found checkpoint at {last_model_path}. Loading...")
         checkpoint = torch.load(last_model_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -336,19 +210,6 @@ def train(
         starting_epoch = checkpoint.get("epoch", starting_epoch) + 1
         best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
         print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
-        did_resume = True
-
-    if not did_resume:
-        pretrained_path = _resolve_pretrained_path(pretrained_file, pretrained_dir=pretrained_dir)
-        if pretrained_file and pretrained_path is None:
-            raise FileNotFoundError(
-                f"Could not find pretrained file '{pretrained_file}'. "
-                f"Expected absolute path or file under '{pretrained_dir}'."
-            )
-        if pretrained_path is not None:
-            _load_pretrained_weights(model, pretrained_path, device)
-        else:
-            print("No checkpoint/pretrained selected. Training from scratch.")
 
     writer = SummaryWriter(comment=f"model={model_name} lr={config['lr']} task={config['task']}")
     t_start_training = time.time()
@@ -369,26 +230,10 @@ def train(
         epoch_start_time = time.time()
 
         train_loss, train_auc, train_acc, _, _, _ = _run_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer=optimizer,
-            device=device,
-            phase="train",
-            scaler=scaler,
-            use_amp=use_amp,
-            grad_accum_steps=grad_accum_steps,
+            model, train_loader, criterion, optimizer=optimizer, device=device, phase="train"
         )
         val_loss, val_auc, val_acc, _, _, _ = _run_epoch(
-            model,
-            val_loader,
-            val_criterion,
-            optimizer=None,
-            device=device,
-            phase="val",
-            scaler=scaler,
-            use_amp=use_amp,
-            grad_accum_steps=1,
+            model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
         )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -465,15 +310,7 @@ def train(
 
     model.eval()
     _, _, _, y_true, y_prob, y_pred = _run_epoch(
-        model,
-        val_loader,
-        val_criterion,
-        optimizer=None,
-        device=device,
-        phase="val",
-        scaler=scaler,
-        use_amp=use_amp,
-        grad_accum_steps=1,
+        model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
     )
 
     _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{config['task']}_curves.png"))
@@ -499,79 +336,7 @@ if __name__ == "__main__":
         default="abnormal,acl,meniscus",
         help="Comma-separated tasks to train (default: abnormal,acl,meniscus)",
     )
-    parser.add_argument(
-        "--pretrained-file",
-        type=str,
-        default="",
-        help=(
-            "Pretrained .pth file to load. "
-            "Can be an absolute path or filename inside model_pretrained."
-        ),
-    )
-    parser.add_argument(
-        "--pretrained-dir",
-        type=str,
-        default=PRETRAINED_DIR,
-        help="Directory containing pretrained files (default: model_pretrained).",
-    )
-    parser.add_argument(
-        "--data-root",
-        type=str,
-        default="data",
-        help="Directory containing train/valid MRI folders (default: ./data).",
-    )
-    parser.add_argument(
-        "--labels-root",
-        type=str,
-        default="labels",
-        help="Directory containing train-*.csv and valid-*.csv (default: ./labels).",
-    )
-    parser.add_argument(
-        "--no-resume",
-        action="store_true",
-        help="Disable loading last checkpoint and start from pretrained/scratch.",
-    )
-    parser.add_argument(
-        "--amp",
-        dest="amp",
-        action="store_true",
-        help="Enable AMP mixed precision on CUDA.",
-    )
-    parser.add_argument(
-        "--no-amp",
-        dest="amp",
-        action="store_false",
-        help="Disable AMP mixed precision.",
-    )
-    parser.set_defaults(amp=True)
-    parser.add_argument(
-        "--grad-accum-steps",
-        type=int,
-        default=1,
-        help="Number of steps to accumulate gradients before optimizer step.",
-    )
-    parser.add_argument(
-        "--list-pretrained",
-        action="store_true",
-        help="List available pretrained files in model_pretrained and exit.",
-    )
     args = parser.parse_args()
-
-    if args.list_pretrained:
-        print(f"Available pretrained files in '{args.pretrained_dir}':")
-        if not os.path.exists(args.pretrained_dir):
-            print("(folder not found)")
-        else:
-            files = sorted(
-                f for f in os.listdir(args.pretrained_dir)
-                if os.path.isfile(os.path.join(args.pretrained_dir, f))
-            )
-            if not files:
-                print("(no files)")
-            else:
-                for f in files:
-                    print(f"- {f}")
-        raise SystemExit(0)
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     for task in tasks:
@@ -579,15 +344,5 @@ if __name__ == "__main__":
         cfg["task"] = task
         print("Training Configuration")
         print(cfg)
-        train(
-            config=cfg,
-            model_name=args.model,
-            pretrained_file=args.pretrained_file,
-            resume=not args.no_resume,
-            data_root=args.data_root,
-            labels_root=args.labels_root,
-            pretrained_dir=args.pretrained_dir,
-            amp=args.amp,
-            grad_accum_steps=args.grad_accum_steps,
-        )
+        train(config=cfg, model_name=args.model)
     print("Training Ended...")
