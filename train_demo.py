@@ -5,6 +5,7 @@ import time
 
 import numpy as np
 import torch
+from torch.cuda.amp import GradScaler, autocast
 from sklearn import metrics
 from torch.utils.tensorboard import SummaryWriter
 
@@ -31,7 +32,16 @@ def _build_model(name: str):
     raise ValueError(f"Unsupported model: {name}")
 
 
-def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train"):
+def _run_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer=None,
+    device="cpu",
+    phase="train",
+    scaler=None,
+    use_amp=False,
+):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
@@ -53,14 +63,20 @@ def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="tr
             label = label.to(device)
 
         if is_train:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(is_train):
-            output = model(images)
-            loss = criterion(output, label)
+            with autocast(enabled=bool(use_amp and device != "cpu")):
+                output = model(images)
+                loss = criterion(output, label)
             if is_train:
-                loss.backward()
-                optimizer.step()
+                if scaler is not None and bool(use_amp and device != "cpu"):
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
         losses.append(loss.item())
 
@@ -196,6 +212,9 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=3, factor=0.3, threshold=1e-4
     )
+    use_amp = bool(device == "cuda")
+    scaler = GradScaler(enabled=use_amp)
+    print(f"AMP enabled: {use_amp}")
 
     starting_epoch = config["starting_epoch"]
     num_epochs = config["max_epoch"]
@@ -232,10 +251,24 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         epoch_start_time = time.time()
 
         train_loss, train_auc, train_acc, _, _, _ = _run_epoch(
-            model, train_loader, criterion, optimizer=optimizer, device=device, phase="train"
+            model,
+            train_loader,
+            criterion,
+            optimizer=optimizer,
+            device=device,
+            phase="train",
+            scaler=scaler,
+            use_amp=use_amp,
         )
         val_loss, val_auc, val_acc, _, _, _ = _run_epoch(
-            model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
+            model,
+            val_loader,
+            val_criterion,
+            optimizer=None,
+            device=device,
+            phase="val",
+            scaler=scaler,
+            use_amp=use_amp,
         )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -312,7 +345,14 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
 
     model.eval()
     _, _, _, y_true, y_prob, y_pred = _run_epoch(
-        model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
+        model,
+        val_loader,
+        val_criterion,
+        optimizer=None,
+        device=device,
+        phase="val",
+        scaler=scaler,
+        use_amp=use_amp,
     )
 
     _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{config['task']}_curves.png"))
