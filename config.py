@@ -1,3 +1,5 @@
+import os
+
 config = {
     'max_epoch' : 50,
     'log_train' : 100,
@@ -13,5 +15,13 @@ config = {
     # Colab-friendly defaults to reduce GPU memory
     'image_size' : 224,
     'target_slices' : 24,
-    'num_workers' : 2
+    'num_workers' : 2,
+    # Warm-start ACL/Meniscus from Abnormal checkpoint (useful on Kaggle).
+    # You can override by env var ABNORMAL_WARMSTART_PTH or CLI --abnormal-pth.
+    'abnormal_warmstart_path' : os.environ.get(
+        'ABNORMAL_WARMSTART_PTH',
+        '/kaggle/working/weights/abnormal/efficientnetb0_best_model.pth',
+    ),
+    'warmstart_tasks' : ['acl', 'meniscus'],
+    'warmstart_from_abnormal' : 1,
 }

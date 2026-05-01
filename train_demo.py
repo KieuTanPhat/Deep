@@ -32,6 +32,62 @@ def _build_model(name: str):
     raise ValueError(f"Unsupported model: {name}")
 
 
+def _extract_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        if isinstance(checkpoint.get("model_state_dict"), dict):
+            return checkpoint["model_state_dict"]
+        if isinstance(checkpoint.get("state_dict"), dict):
+            return checkpoint["state_dict"]
+        return checkpoint
+    return None
+
+
+def _try_warmstart_from_abnormal(model, config, task, last_model_path, device):
+    if os.path.exists(last_model_path):
+        return
+    if not bool(config.get("warmstart_from_abnormal", 1)):
+        return
+
+    warmstart_tasks = set(config.get("warmstart_tasks", ["acl", "meniscus"]))
+    if task not in warmstart_tasks:
+        return
+
+    abnormal_path = str(config.get("abnormal_warmstart_path", "")).strip()
+    if not abnormal_path:
+        print(f"Skip warm-start for task={task}: abnormal_warmstart_path is empty.")
+        return
+
+    abnormal_path = os.path.abspath(os.path.expandvars(os.path.expanduser(abnormal_path)))
+    if not os.path.exists(abnormal_path):
+        print(f"Skip warm-start for task={task}: checkpoint not found at {abnormal_path}")
+        return
+
+    try:
+        checkpoint = torch.load(abnormal_path, map_location=device)
+        state_dict = _extract_state_dict(checkpoint)
+        if not isinstance(state_dict, dict):
+            print(f"Skip warm-start for task={task}: invalid checkpoint format at {abnormal_path}")
+            return
+
+        if any(key.startswith("module.") for key in state_dict.keys()):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        loaded_count = len(model.state_dict()) - len(missing)
+        if loaded_count == 0:
+            print(
+                f"Skip warm-start for task={task}: no compatible tensors in {abnormal_path} "
+                f"(unexpected={len(unexpected)})"
+            )
+            return
+        print(
+            f"Warm-started task={task} from abnormal checkpoint: {abnormal_path} "
+            f"(loaded={loaded_count}, missing={len(missing)}, unexpected={len(unexpected)})"
+        )
+    except Exception as exc:
+        print(f"Skip warm-start for task={task}: failed loading {abnormal_path} ({exc})")
+
+
 def _run_epoch(
     model,
     loader,
@@ -254,6 +310,14 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         val_wts = val_wts.cuda()
         if test_wts is not None:
             test_wts = test_wts.cuda()
+
+    _try_warmstart_from_abnormal(
+        model=model,
+        config=config,
+        task=config["task"],
+        last_model_path=last_model_path,
+        device=device,
+    )
 
     print("Initializing Loss Method...")
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=train_wts)
@@ -573,12 +637,20 @@ if __name__ == "__main__":
         default="labels",
         help="Directory containing train-*.csv, valid-*.csv and test-*.csv (default: ./labels).",
     )
+    parser.add_argument(
+        "--abnormal-pth",
+        type=str,
+        default=None,
+        help="Absolute/relative path to abnormal checkpoint used to warm-start acl/meniscus.",
+    )
     args = parser.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     for task in tasks:
         cfg = dict(base_config)
         cfg["task"] = task
+        if args.abnormal_pth:
+            cfg["abnormal_warmstart_path"] = args.abnormal_pth
         print("Training Configuration")
         print(cfg)
         train(
