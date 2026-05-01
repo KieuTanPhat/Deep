@@ -3,7 +3,7 @@ import os
 config = {
     'max_epoch' : 50,
     'log_train' : 100,
-    'lr' : 1e-5,
+    'lr' : 2e-5,
     'starting_epoch' : 0,
     'batch_size' : 4,
     'log_val' : 10,
