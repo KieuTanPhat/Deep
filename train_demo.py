@@ -42,6 +42,26 @@ def _extract_state_dict(checkpoint):
     return None
 
 
+def _unwrap_model(model):
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module
+    return model
+
+
+def _load_model_state_dict(model, state_dict, strict=False):
+    if not isinstance(state_dict, dict):
+        raise ValueError("state_dict must be a dict.")
+
+    target_model = _unwrap_model(model)
+    if any(key.startswith("module.") for key in state_dict.keys()):
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    return target_model.load_state_dict(state_dict, strict=strict)
+
+
+def _get_model_state_dict_for_save(model):
+    return _unwrap_model(model).state_dict()
+
+
 def _try_warmstart_from_abnormal(model, config, task, last_model_path, device):
     if os.path.exists(last_model_path):
         return
@@ -69,10 +89,7 @@ def _try_warmstart_from_abnormal(model, config, task, last_model_path, device):
             print(f"Skip warm-start for task={task}: invalid checkpoint format at {abnormal_path}")
             return
 
-        if any(key.startswith("module.") for key in state_dict.keys()):
-            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing, unexpected = _load_model_state_dict(model, state_dict, strict=False)
         loaded_count = len(model.state_dict()) - len(missing)
         if loaded_count == 0:
             print(
@@ -306,6 +323,11 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         model = model.cuda()
+        if torch.cuda.device_count() > 1:
+            model = torch.nn.DataParallel(model)
+            print(f"DataParallel enabled on {torch.cuda.device_count()} GPUs.")
+        else:
+            print("DataParallel disabled: only 1 GPU is available.")
         train_wts = train_wts.cuda()
         val_wts = val_wts.cuda()
         if test_wts is not None:
@@ -347,7 +369,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
     if os.path.exists(last_model_path):
         print(f"Found checkpoint at {last_model_path}. Loading...")
         checkpoint = torch.load(last_model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        _load_model_state_dict(model, checkpoint["model_state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         starting_epoch = checkpoint.get("epoch", starting_epoch) + 1
@@ -487,7 +509,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
             print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": _get_model_state_dict_for_save(model),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "epoch": epoch,
@@ -499,7 +521,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
 
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": _get_model_state_dict_for_save(model),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "epoch": epoch,
@@ -524,7 +546,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
     # Load best model for final evaluation/plots
     if os.path.exists(best_model_path):
         checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        _load_model_state_dict(model, checkpoint["model_state_dict"], strict=True)
 
     model.eval()
     _, val_true, val_prob = _run_epoch(

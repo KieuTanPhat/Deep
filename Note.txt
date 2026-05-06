@@ -1,0 +1,4 @@
+1. Pretrained với MRI Não -> Failed
+2. Thay max-pooling theo slice = mean + max pooling -> ?
+3. FC deeper + Dropout
+4. 
