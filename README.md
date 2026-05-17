@@ -1,4 +1,4 @@
-# DeepLearning_v - Huấn Luyện Model MRI Gối
+# DeepLearning_v - Train Model MRI Gối
 
 Thư mục này chứa pipeline huấn luyện model deep learning để chẩn đoán chấn thương gối từ MRI theo 3 mặt cắt:
 
