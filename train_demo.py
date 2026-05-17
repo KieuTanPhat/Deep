@@ -114,19 +114,25 @@ def _run_epoch(
     phase="train",
     scaler=None,
     use_amp=False,
+    grad_accum_steps=1,
 ):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
+    grad_accum_steps = max(1, int(grad_accum_steps))
 
     y_true = []
     y_prob = []
     losses = []
+    total_batches = len(loader)
 
     iterator = loader
     if tqdm is not None:
         iterator = tqdm(loader, desc=phase, leave=False)
 
-    for batch in iterator:
+    if is_train:
+        optimizer.zero_grad(set_to_none=True)
+
+    for batch_idx, batch in enumerate(iterator):
         if batch is None:
             continue
         images, label = batch
@@ -135,21 +141,24 @@ def _run_epoch(
             images = [img.to(device) for img in images]
             label = label.to(device)
 
-        if is_train:
-            optimizer.zero_grad(set_to_none=True)
-
         with torch.set_grad_enabled(is_train):
             with autocast(enabled=bool(use_amp and device != "cpu")):
                 output = model(images)
                 loss = criterion(output, label)
             if is_train:
+                loss_for_backward = loss / grad_accum_steps
+                should_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == total_batches)
                 if scaler is not None and bool(use_amp and device != "cpu"):
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                    scaler.scale(loss_for_backward).backward()
+                    if should_step:
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
                 else:
-                    loss.backward()
-                    optimizer.step()
+                    loss_for_backward.backward()
+                    if should_step:
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
 
         losses.append(loss.item())
 
@@ -354,11 +363,20 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
     print("Setup the Optimizer")
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=3, factor=0.3, threshold=1e-4
+        optimizer, mode="max", patience=3, factor=0.3, threshold=1e-4
     )
     use_amp = bool(device == "cuda")
     scaler = GradScaler(enabled=use_amp)
     print(f"AMP enabled: {use_amp}")
+    grad_accum_steps = int(config.get("gradient_accumulation_steps", 1))
+    if not bool(config.get("use_gradient_accumulation", 0)):
+        grad_accum_steps = 1
+    grad_accum_steps = max(1, grad_accum_steps)
+    effective_batch_size = config["batch_size"] * grad_accum_steps
+    print(
+        f"Batch size: {config['batch_size']} | Grad accumulation steps: {grad_accum_steps} | "
+        f"Effective batch size: {effective_batch_size}"
+    )
 
     starting_epoch = config["starting_epoch"]
     num_epochs = config["max_epoch"]
@@ -371,7 +389,10 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         checkpoint = torch.load(last_model_path, map_location=device)
         _load_model_state_dict(model, checkpoint["model_state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if checkpoint.get("scheduler_monitor") == "val_auc":
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            print("Skip loading old scheduler state because it was not configured for val_auc.")
         starting_epoch = checkpoint.get("epoch", starting_epoch) + 1
         best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
         print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
@@ -415,6 +436,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
             phase="train",
             scaler=scaler,
             use_amp=use_amp,
+            grad_accum_steps=grad_accum_steps,
         )
         val_loss, val_true, val_prob = _run_epoch(
             model,
@@ -447,7 +469,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         writer.add_scalar("Val/BestThreshold_F1", val_best_threshold, epoch)
         writer.add_scalar("Val/BestF1_epoch", val_best_metrics["f1"], epoch)
 
-        scheduler.step(val_loss)
+        scheduler.step(val_metrics["auc"])
 
         t_end = time.time()
         delta = t_end - epoch_start_time
@@ -515,6 +537,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
                     "epoch": epoch,
                     "best_val_auc": best_val_auc,
                     "model_name": model_name,
+                    "scheduler_monitor": "val_auc",
                 },
                 best_model_path,
             )
@@ -527,6 +550,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
                 "epoch": epoch,
                 "best_val_auc": best_val_auc,
                 "model_name": model_name,
+                "scheduler_monitor": "val_auc",
             },
             last_model_path,
         )

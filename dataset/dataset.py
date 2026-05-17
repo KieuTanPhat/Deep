@@ -4,7 +4,7 @@ import numpy as np
 
 import torch
 import torch.utils.data as data
-from torch.utils.data import WeightedRandomSampler
+import torch.nn.functional as F
 from torchvision import transforms
 
 from preprocessing.slice_sampling import uniform_slice_sampling
@@ -100,14 +100,33 @@ class MRData(data.Dataset):
         return [img_raw[plane] for plane in self.planes], label
 
     def _resize_image(self, image):
-        # 1. Resize/Crop (C???t gi???a ???nh)
+        # 1. Center crop when possible, then resize safely if needed.
         target = self.input_dim
-        if target is not None and target <= image.shape[1] and target <= image.shape[2]:
-            pad = int((image.shape[2] - target) / 2)
-            image = image[:, pad:-pad, pad:-pad]
+        if target is not None:
+            height, width = image.shape[1], image.shape[2]
+            if height >= target and width >= target:
+                top = (height - target) // 2
+                left = (width - target) // 2
+                image = image[:, top:top + target, left:left + target]
+
+            if image.shape[1] != target or image.shape[2] != target:
+                image_tensor = torch.from_numpy(np.ascontiguousarray(image)).unsqueeze(1).float()
+                image_tensor = F.interpolate(
+                    image_tensor,
+                    size=(target, target),
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                image = image_tensor.squeeze(1).numpy()
         
         # 2. Normalize (Chu???n h??a)
-        image = (image - np.min(image)) / (np.max(image) - np.min(image)) * MAX_PIXEL_VAL
+        image_min = np.min(image)
+        image_max = np.max(image)
+        denom = image_max - image_min
+        if denom > 1e-6:
+            image = (image - image_min) / denom * MAX_PIXEL_VAL
+        else:
+            image = np.zeros_like(image, dtype=np.float32)
         image = (image - MEAN) / STDDEV
 
         # 3. Chuy???n sang Tensor
@@ -154,14 +173,7 @@ def load_data(
         data_root=data_root,
         label_root=label_root,
     )
-    # Weighted sampling to balance classes in each batch
-    labels = train_data.labels
-    class_counts = np.bincount(labels)
-    class_weights = 1.0 / np.maximum(class_counts, 1)
-    sample_weights = class_weights[labels]
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-    # num_workers=0 ????? tr??nh l???i tr??n Windows
-    train_loader = data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, sampler=sampler)
+    train_loader = data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, shuffle=True)
 
     print('Loading Validation Dataset of {} task...'.format(task))
     val_data = MRData(
