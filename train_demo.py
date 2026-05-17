@@ -3,6 +3,8 @@ import csv
 import os
 import time
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import torch
 from torch.cuda.amp import GradScaler, autocast
@@ -689,6 +691,24 @@ if __name__ == "__main__":
         default=None,
         help="Absolute/relative path to abnormal checkpoint used to warm-start acl/meniscus.",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override config batch_size. This is the micro-batch size kept in GPU memory.",
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=None,
+        help="Override config gradient_accumulation_steps.",
+    )
+    parser.add_argument(
+        "--target-slices",
+        type=int,
+        default=None,
+        help="Override config target_slices to reduce/increase per-volume memory.",
+    )
     args = parser.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -697,6 +717,13 @@ if __name__ == "__main__":
         cfg["task"] = task
         if args.abnormal_pth:
             cfg["abnormal_warmstart_path"] = args.abnormal_pth
+        if args.batch_size is not None:
+            cfg["batch_size"] = args.batch_size
+        if args.grad_accum_steps is not None:
+            cfg["gradient_accumulation_steps"] = args.grad_accum_steps
+            cfg["use_gradient_accumulation"] = int(args.grad_accum_steps > 1)
+        if args.target_slices is not None:
+            cfg["target_slices"] = args.target_slices
         print("Training Configuration")
         print(cfg)
         train(
