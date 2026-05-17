@@ -17,9 +17,7 @@ Các task hiện hỗ trợ:
 ```text
 DeepLearning_v/
 ├── config.py                  # Cấu hình train mặc định
-├── train_demo.py              # Script train chính đang dùng
-├── train.py                   # Script train cũ cho MRNet
-├── test.py                    # Script kiểm tra nhanh dataset/pipeline
+├── train_demo.py              # Script train chính đang dùng                  # Script train cũ cho MRNet
 ├── dataset/
 │   └── dataset.py             # Dataset loader, preprocessing, DataLoader
 ├── models/
