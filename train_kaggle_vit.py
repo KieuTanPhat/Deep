@@ -36,7 +36,14 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
+try:
+    from torch.amp import GradScaler, autocast
+    def _make_scaler(enabled): return GradScaler('cuda', enabled=enabled)
+    def _autocast(enabled): return autocast('cuda', enabled=enabled)
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast
+    def _make_scaler(enabled): return GradScaler(enabled=enabled)
+    def _autocast(enabled): return autocast(enabled=enabled)
 from sklearn import metrics
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -133,7 +140,7 @@ def _run_epoch(model, loader, criterion, optimizer=None, device="cpu",
             label = label.to(device)
 
         with torch.set_grad_enabled(is_train):
-            with autocast(enabled=bool(use_amp and device != "cpu")):
+            with _autocast(enabled=bool(use_amp and device != "cpu")):
                 output = model(images)
                 loss = criterion(output, label)
 
@@ -311,7 +318,7 @@ def train(config: dict, data_root: str, labels_root: str, freeze_epochs: int = 0
         optimizer, mode="max", patience=3, factor=0.3, threshold=1e-4
     )
     use_amp = (device == "cuda")
-    scaler  = GradScaler(enabled=use_amp)
+    scaler  = _make_scaler(enabled=use_amp)
     grad_accum = int(config.get("gradient_accumulation_steps", 1)) if config.get("use_gradient_accumulation") else 1
     grad_accum = max(1, grad_accum)
     print(f"AMP: {use_amp} | batch={config['batch_size']} | grad_accum={grad_accum} | effective_bs={config['batch_size']*grad_accum}")
