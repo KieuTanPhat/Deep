@@ -318,9 +318,17 @@ def train(config: dict, data_root: str, labels_root: str, freeze_epochs: int = 0
         print(f"Tìm thấy checkpoint: {last_model_path}")
         ckpt = torch.load(last_model_path, map_location=device)
         _load_model_state_dict(model, ckpt["model_state_dict"], strict=True)
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except ValueError as exc:
+            print(f"Skip optimizer state because param groups changed after scheduler fix: {exc}")
         if ckpt.get("scheduler_monitor") == "val_auc":
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                if len(getattr(scheduler, "min_lrs", [])) != len(optimizer.param_groups):
+                    scheduler.min_lrs = [0] * len(optimizer.param_groups)
+            except Exception as exc:
+                print(f"Skip scheduler state because it is incompatible: {exc}")
         starting_epoch = ckpt.get("epoch", starting_epoch) + 1
         best_val_auc   = ckpt.get("best_val_auc", 0.0)
         print(f"Resume từ epoch {starting_epoch} | Best AUC: {best_val_auc:.4f}")
