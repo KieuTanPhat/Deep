@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset import load_data
 from config import config as base_config
-from models import Densenet121, EfficientNetB0, EfficientNetB0ViT
+from models import Densenet121, EfficientNetB0, EfficientNetB0_ViT, EfficientNetViT
 from utils import _get_lr
 
 import matplotlib
@@ -35,6 +35,7 @@ MODEL_ALIASES = {
     "efficientnetb0vit": "efficientnetb0_vit",
     "effectionnetb0_vit": "efficientnetb0_vit",
     "effectionnectb0_vit": "efficientnetb0_vit",
+    "efficientnetvit": "efficientnetvit",
 }
 
 
@@ -53,16 +54,18 @@ def _build_model(name: str, config: dict):
     if name == "efficientnetb0":
         return EfficientNetB0()
     if name == "efficientnetb0_vit":
-        return EfficientNetB0ViT(
-            vit_dim=int(config.get("vit_dim", 384)),
+        return EfficientNetB0_ViT(
+            vit_dim=int(config.get("vit_dim", 256)),
             vit_depth=int(config.get("vit_depth", 2)),
-            vit_heads=int(config.get("vit_heads", 6)),
+            vit_heads=int(config.get("vit_heads", 4)),
             vit_mlp_ratio=float(config.get("vit_mlp_ratio", 2.0)),
             vit_dropout=float(config.get("vit_dropout", 0.2)),
             classifier_dropout=float(config.get("classifier_dropout", 0.35)),
             max_slices=max(64, int(config.get("target_slices", 24))),
             pooling=str(config.get("vit_pooling", "cls_attention")),
         )
+    if name == "efficientnetvit":
+        return EfficientNetViT(max_slices=max(64, int(config.get("target_slices", 24))))
     raise ValueError(f"Unsupported model: {name}")
 
 
@@ -114,6 +117,16 @@ def _load_model_state_dict(model, state_dict, strict=False):
     target_model = _unwrap_model(model)
     if any(key.startswith("module.") for key in state_dict.keys()):
         state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+    if not strict:
+        # Loại bỏ key có shape không khớp để tránh RuntimeError khi warm-start
+        # giữa các model khác kiến trúc (vd: EfficientNetB0 → EfficientNetB0_ViT).
+        model_sd = target_model.state_dict()
+        state_dict = {
+            k: v for k, v in state_dict.items()
+            if k not in model_sd or v.shape == model_sd[k].shape
+        }
+
     return target_model.load_state_dict(state_dict, strict=strict)
 
 
