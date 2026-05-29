@@ -1,30 +1,3 @@
-# =============================================================================
-# HƯỚNG DẪN CHẠY TRÊN KAGGLE
-# =============================================================================
-#
-# BƯỚC 1: Upload code lên Kaggle
-#   - Zip toàn bộ thư mục project (DeepLearning-v3) thành mrnet-code.zip
-#   - Tạo Kaggle Dataset mới → Upload mrnet-code.zip
-#   - Sau khi xử lý, dataset sẽ có tên "mrnet-code"
-#
-# BƯỚC 2: Tạo Notebook mới trên Kaggle
-#   - Chọn Accelerator: GPU T4 x2 hoặc P100
-#   - Add Data: Nhom5_DeepLearning_Dataset  ← dataset của nhóm
-#   - Add Data: mrnet-code (code bạn vừa upload)
-#
-# BƯỚC 3: Trong notebook, chạy các ô sau:
-#
-#   # Ô 1 — Cài thư viện còn thiếu (nếu cần)
-#   !pip install -q scikit-learn
-#
-#   # Ô 2 — Copy code vào working directory
-#   !cp -r /kaggle/input/mrnet-code/DeepLearning-v3/* /kaggle/working/
-#   import os; os.chdir('/kaggle/working')
-#
-#   # Ô 3 — Chạy training
-#   !python train_kaggle_vit.py --tasks abnormal,acl,meniscus --freeze-epochs 5
-#
-# =============================================================================
 
 import argparse
 import csv
@@ -63,8 +36,8 @@ except ImportError:
 # ─── Đường dẫn Kaggle (thay đổi nếu cần) ────────────────────────────────────
 # Dataset: Nhom5_DeepLearning_Dataset
 # Slug Kaggle tự động: nhom5-deeplearning-dataset
-KAGGLE_DATA_ROOT   = "/kaggle/input/nhom5-deeplearning-dataset/data"
-KAGGLE_LABELS_ROOT = "/kaggle/input/nhom5-deeplearning-dataset/labels"
+KAGGLE_DATA_ROOT   = "/kaggle/input/datasets/zuylyn/nhom5-deeplearning-dataset/data"
+KAGGLE_LABELS_ROOT = "/kaggle/input/datasets/zuylyn/nhom5-deeplearning-dataset/labels"
 KAGGLE_OUTPUT_ROOT = "/kaggle/working"
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -78,16 +51,16 @@ MODEL_NAME = "efficientnetvit"
 
 # Config mặc định cho Kaggle (tối ưu VRAM 16GB)
 KAGGLE_CONFIG_OVERRIDES = {
-    "batch_size": 1,
-    "target_slices": 16,     # Giảm số slice để tiết kiệm VRAM
+    "batch_size": 4,
+    "target_slices": 24,
     "image_size": 224,
     "num_workers": 2,
     "use_gradient_accumulation": 1,
-    "gradient_accumulation_steps": 8,  # Effective batch = 1 * 8 = 8
-    "max_epoch": 30,
-    "lr": 1e-4,              # LR cao hơn khi freeze backbone
+    "gradient_accumulation_steps": 8,  # Effective batch = 4 * 8 = 32
+    "max_epoch": 50,
+    "lr": 2e-5,
     "weight_decay": 1e-4,
-    "patience": 7,
+    "patience": 5,
 }
 
 
