@@ -282,9 +282,22 @@ def train(config: dict, data_root: str, labels_root: str, freeze_epochs: int = 0
         criterion = criterion.cuda()
         val_criterion = val_criterion.cuda()
 
+    # Keep optimizer param groups stable from the beginning. ReduceLROnPlateau
+    # stores one min_lr per group and can crash if a new group is added later.
+    base_model = _unwrap_model(model)
+    backbone_params = []
+    backbone_param_ids = set()
+    for net in [base_model.axial_backbone, base_model.coronal_backbone, base_model.sagittal_backbone]:
+        for param in net.parameters():
+            backbone_params.append(param)
+            backbone_param_ids.add(id(param))
+    head_params = [param for param in model.parameters() if id(param) not in backbone_param_ids]
+
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=config["lr"],
+        [
+            {"params": head_params, "lr": config["lr"], "name": "head"},
+            {"params": backbone_params, "lr": config["lr"] / 20, "name": "backbone"},
+        ],
         weight_decay=config["weight_decay"],
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -336,16 +349,10 @@ def train(config: dict, data_root: str, labels_root: str, freeze_epochs: int = 0
             print(f"\nEpoch {epoch}: Unfreeze backbone + giảm LR xuống {config['lr']/10:.2e}")
             _unwrap_model(model).unfreeze_backbones()
             for pg in optimizer.param_groups:
-                pg["lr"] = config["lr"] / 10
-            # Thêm backbone params vào optimizer
-            backbone_params = []
-            for net in [
-                _unwrap_model(model).axial_backbone,
-                _unwrap_model(model).coronal_backbone,
-                _unwrap_model(model).sagittal_backbone,
-            ]:
-                backbone_params.extend(net.parameters())
-            optimizer.add_param_group({"params": backbone_params, "lr": config["lr"] / 20})
+                if pg.get("name") == "backbone":
+                    pg["lr"] = config["lr"] / 20
+                else:
+                    pg["lr"] = config["lr"] / 10
 
         ep_start = time.time()
         train_loss, tr_true, tr_prob = _run_epoch(
