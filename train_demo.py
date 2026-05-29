@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset import load_data
 from config import config as base_config
-from models import Densenet121, EfficientNetB0
+from models import Densenet121, EfficientNetB0, EfficientNetB0_ViT
 from utils import _get_lr
 
 import matplotlib
@@ -31,6 +31,8 @@ def _build_model(name: str):
         return Densenet121()
     if name == "efficientnetb0":
         return EfficientNetB0()
+    if name == "efficientnetb0_vit":
+        return EfficientNetB0_ViT()
     raise ValueError(f"Unsupported model: {name}")
 
 
@@ -57,6 +59,16 @@ def _load_model_state_dict(model, state_dict, strict=False):
     target_model = _unwrap_model(model)
     if any(key.startswith("module.") for key in state_dict.keys()):
         state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+    if not strict:
+        # Loại bỏ key có shape không khớp để tránh RuntimeError khi warm-start
+        # giữa các model khác kiến trúc (vd: EfficientNetB0 → EfficientNetB0_ViT).
+        model_sd = target_model.state_dict()
+        state_dict = {
+            k: v for k, v in state_dict.items()
+            if k not in model_sd or v.shape == model_sd[k].shape
+        }
+
     return target_model.load_state_dict(state_dict, strict=strict)
 
 
@@ -664,7 +676,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="efficientnetb0",
-        choices=["densenet121", "efficientnetb0"],
+        choices=["densenet121", "efficientnetb0", "efficientnetb0_vit"],
         help="Choose model to train",
     )
     parser.add_argument(
