@@ -53,8 +53,16 @@ class MRData(data.Dataset):
             header=None,
             names=['id', 'label']
         )
+        # Hỗ trợ cả hai cách đặt tên folder: "valid" (code chuẩn) và "val" (Kaggle dataset)
+        split_dir = self.split
+        if split_dir == 'valid':
+            valid_path = os.path.join(self.data_root, 'valid')
+            val_path   = os.path.join(self.data_root, 'val')
+            if not os.path.isdir(valid_path) and os.path.isdir(val_path):
+                split_dir = 'val'
+
         for plane in self.planes:
-            self.image_path[plane] = os.path.join(self.data_root, self.split, plane)
+            self.image_path[plane] = os.path.join(self.data_root, split_dir, plane)
 
         self.transform = transform
         self.records['id'] = self.records['id'].map(lambda i: '0' * (4 - len(str(i))) + str(i))
