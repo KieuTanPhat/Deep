@@ -1,6 +1,8 @@
 import argparse
 import csv
 import os
+import random
+import re
 import time
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -13,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset import load_data
 from config import config as base_config
-from models import Densenet121, EfficientNetB0
+from models import Densenet121, EfficientNetB0, EfficientNetB0ViT
 from utils import _get_lr
 
 import matplotlib
@@ -25,13 +27,68 @@ except Exception:
     tqdm = None
 
 
-def _build_model(name: str):
+MODEL_ALIASES = {
+    "densenet121": "densenet121",
+    "efficientnetb0": "efficientnetb0",
+    "efficientnetb0_vit": "efficientnetb0_vit",
+    "efficientnetb0-vit": "efficientnetb0_vit",
+    "efficientnetb0vit": "efficientnetb0_vit",
+    "effectionnetb0_vit": "efficientnetb0_vit",
+    "effectionnectb0_vit": "efficientnetb0_vit",
+}
+
+
+def _canonical_model_name(name: str):
+    key = name.lower().replace(" ", "").replace("__", "_")
+    if key not in MODEL_ALIASES:
+        raise ValueError(f"Unsupported model: {name}")
+    return MODEL_ALIASES[key]
+
+
+def _build_model(name: str, config: dict):
     name = name.lower()
+    name = _canonical_model_name(name)
     if name == "densenet121":
         return Densenet121()
     if name == "efficientnetb0":
         return EfficientNetB0()
+    if name == "efficientnetb0_vit":
+        return EfficientNetB0ViT(
+            vit_dim=int(config.get("vit_dim", 384)),
+            vit_depth=int(config.get("vit_depth", 2)),
+            vit_heads=int(config.get("vit_heads", 6)),
+            vit_mlp_ratio=float(config.get("vit_mlp_ratio", 2.0)),
+            vit_dropout=float(config.get("vit_dropout", 0.2)),
+            classifier_dropout=float(config.get("classifier_dropout", 0.35)),
+            max_slices=max(64, int(config.get("target_slices", 24))),
+            pooling=str(config.get("vit_pooling", "cls_attention")),
+        )
     raise ValueError(f"Unsupported model: {name}")
+
+
+def _slugify(value: str):
+    value = str(value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9_.-]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value
+
+
+def _artifact_suffix(config: dict):
+    exp_name = _slugify(config.get("exp_name", ""))
+    if exp_name in {"", "test", "default"}:
+        return ""
+    return f"_{exp_name}"
+
+
+def _set_seed(seed):
+    if seed is None:
+        return
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _extract_state_dict(checkpoint):
@@ -62,6 +119,40 @@ def _load_model_state_dict(model, state_dict, strict=False):
 
 def _get_model_state_dict_for_save(model):
     return _unwrap_model(model).state_dict()
+
+
+def _set_backbone_frozen(model, freeze):
+    model = _unwrap_model(model)
+    if hasattr(model, "freeze_feature_extractors"):
+        model.freeze_feature_extractors(freeze=freeze)
+        state = "frozen" if freeze else "trainable"
+        print(f"Backbone feature extractors are now {state}.")
+
+
+def _build_optimizer(model, config):
+    model_for_groups = _unwrap_model(model)
+    optimizer_name = str(config.get("optimizer", "adamw")).lower()
+    lr = float(config["lr"])
+    weight_decay = float(config["weight_decay"])
+
+    if hasattr(model_for_groups, "backbone_parameters") and hasattr(model_for_groups, "head_parameters"):
+        backbone_params = [p for p in model_for_groups.backbone_parameters() if p.requires_grad]
+        head_params = [p for p in model_for_groups.head_parameters() if p.requires_grad]
+        params = [
+            {
+                "params": backbone_params,
+                "lr": lr * float(config.get("backbone_lr_mult", 0.3)),
+            },
+            {"params": head_params, "lr": lr},
+        ]
+    else:
+        params = model.parameters()
+
+    if optimizer_name == "adam":
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
 
 def _try_warmstart_from_abnormal(model, config, task, last_model_path, device):
@@ -117,6 +208,8 @@ def _run_epoch(
     scaler=None,
     use_amp=False,
     grad_accum_steps=1,
+    max_grad_norm=0.0,
+    label_smoothing=0.0,
 ):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -146,19 +239,28 @@ def _run_epoch(
         with torch.set_grad_enabled(is_train):
             with autocast(enabled=bool(use_amp and device != "cpu")):
                 output = model(images)
-                loss = criterion(output, label)
+                loss_label = label
+                if is_train and float(label_smoothing) > 0:
+                    smoothing = float(label_smoothing)
+                    loss_label = label * (1.0 - smoothing) + 0.5 * smoothing
+                loss = criterion(output, loss_label)
             if is_train:
                 loss_for_backward = loss / grad_accum_steps
                 should_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == total_batches)
                 if scaler is not None and bool(use_amp and device != "cpu"):
                     scaler.scale(loss_for_backward).backward()
                     if should_step:
+                        if float(max_grad_norm) > 0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad(set_to_none=True)
                 else:
                     loss_for_backward.backward()
                     if should_step:
+                        if float(max_grad_norm) > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
 
@@ -307,10 +409,18 @@ def _plot_roc(y_true, y_prob, out_path):
 
 
 def train(config: dict, model_name: str, data_root: str = "data", labels_root: str = "labels"):
-    save_folder = os.path.join("weights", config["task"])
+    model_name = _canonical_model_name(model_name)
+    _set_seed(config.get("seed", None))
+
+    suffix = _artifact_suffix(config)
+    exp_name = _slugify(config.get("exp_name", ""))
+    if suffix:
+        save_folder = os.path.join("weights", config["task"], exp_name)
+    else:
+        save_folder = os.path.join("weights", config["task"])
     os.makedirs(save_folder, exist_ok=True)
 
-    eval_folder = os.path.join("evaluation", f"{model_name}_{config['task']}")
+    eval_folder = os.path.join("evaluation", f"{model_name}_{config['task']}{suffix}")
     os.makedirs(eval_folder, exist_ok=True)
 
     csv_path = os.path.join(eval_folder, f"{model_name}_{config['task']}_metrics.csv")
@@ -330,7 +440,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
     )
 
     print("Initializing Model...")
-    model = _build_model(model_name)
+    model = _build_model(model_name, config)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         model = model.cuda()
@@ -363,7 +473,7 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
             test_criterion = test_criterion.cuda()
 
     print("Setup the Optimizer")
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
+    optimizer = _build_optimizer(model, config)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", patience=3, factor=0.3, threshold=1e-4
     )
@@ -424,8 +534,15 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
         "lr",
     ]
     _ensure_csv_header(csv_path, header)
+    freeze_backbone_epochs = int(config.get("freeze_backbone_epochs", 0))
+    backbone_is_frozen = None
 
     for epoch in range(starting_epoch, num_epochs):
+        should_freeze_backbone = bool(freeze_backbone_epochs > 0 and epoch < freeze_backbone_epochs)
+        if should_freeze_backbone != backbone_is_frozen:
+            _set_backbone_frozen(model, should_freeze_backbone)
+            backbone_is_frozen = should_freeze_backbone
+
         current_lr = _get_lr(optimizer)
         epoch_start_time = time.time()
 
@@ -439,6 +556,8 @@ def train(config: dict, model_name: str, data_root: str = "data", labels_root: s
             scaler=scaler,
             use_amp=use_amp,
             grad_accum_steps=grad_accum_steps,
+            max_grad_norm=float(config.get("max_grad_norm", 0.0)),
+            label_smoothing=float(config.get("label_smoothing", 0.0)),
         )
         val_loss, val_true, val_prob = _run_epoch(
             model,
@@ -663,9 +782,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="efficientnetb0",
-        choices=["densenet121", "efficientnetb0"],
-        help="Choose model to train",
+        default="efficientnetb0_vit",
+        help="Choose model to train: densenet121, efficientnetb0 or efficientnetb0_vit.",
     )
     parser.add_argument(
         "--tasks",
@@ -709,8 +827,39 @@ if __name__ == "__main__":
         default=None,
         help="Override config target_slices to reduce/increase per-volume memory.",
     )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=None,
+        help="Override config image_size.",
+    )
+    parser.add_argument("--exp-name", type=str, default=None, help="Optional run name for separate artifacts.")
+    parser.add_argument("--max-epoch", type=int, default=None, help="Override config max_epoch.")
+    parser.add_argument("--lr", type=float, default=None, help="Override config learning rate.")
+    parser.add_argument("--weight-decay", type=float, default=None, help="Override config weight_decay.")
+    parser.add_argument("--patience", type=int, default=None, help="Override early stopping patience.")
+    parser.add_argument("--seed", type=int, default=None, help="Override random seed.")
+    parser.add_argument("--optimizer", type=str, default=None, choices=["adam", "adamw"], help="Optimizer.")
+    parser.add_argument("--backbone-lr-mult", type=float, default=None, help="LR multiplier for CNN backbones.")
+    parser.add_argument("--max-grad-norm", type=float, default=None, help="Gradient clipping max norm.")
+    parser.add_argument("--label-smoothing", type=float, default=None, help="Binary label smoothing amount.")
+    parser.add_argument("--freeze-backbone-epochs", type=int, default=None, help="Warm-up epochs with frozen CNN backbones.")
+    parser.add_argument("--vit-dim", type=int, default=None, help="Transformer hidden dimension.")
+    parser.add_argument("--vit-depth", type=int, default=None, help="Transformer encoder layers.")
+    parser.add_argument("--vit-heads", type=int, default=None, help="Transformer attention heads.")
+    parser.add_argument("--vit-mlp-ratio", type=float, default=None, help="Transformer MLP expansion ratio.")
+    parser.add_argument("--vit-dropout", type=float, default=None, help="Transformer dropout.")
+    parser.add_argument("--classifier-dropout", type=float, default=None, help="Classifier dropout.")
+    parser.add_argument(
+        "--vit-pooling",
+        type=str,
+        default=None,
+        choices=["cls", "mean", "max", "attention", "cls_attention"],
+        help="Pooling mode for transformer tokens.",
+    )
     args = parser.parse_args()
 
+    model_name = _canonical_model_name(args.model)
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     for task in tasks:
         cfg = dict(base_config)
@@ -724,11 +873,36 @@ if __name__ == "__main__":
             cfg["use_gradient_accumulation"] = int(args.grad_accum_steps > 1)
         if args.target_slices is not None:
             cfg["target_slices"] = args.target_slices
+        if args.image_size is not None:
+            cfg["image_size"] = args.image_size
+        override_map = {
+            "exp_name": args.exp_name,
+            "max_epoch": args.max_epoch,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "patience": args.patience,
+            "seed": args.seed,
+            "optimizer": args.optimizer,
+            "backbone_lr_mult": args.backbone_lr_mult,
+            "max_grad_norm": args.max_grad_norm,
+            "label_smoothing": args.label_smoothing,
+            "freeze_backbone_epochs": args.freeze_backbone_epochs,
+            "vit_dim": args.vit_dim,
+            "vit_depth": args.vit_depth,
+            "vit_heads": args.vit_heads,
+            "vit_mlp_ratio": args.vit_mlp_ratio,
+            "vit_dropout": args.vit_dropout,
+            "classifier_dropout": args.classifier_dropout,
+            "vit_pooling": args.vit_pooling,
+        }
+        for key, value in override_map.items():
+            if value is not None:
+                cfg[key] = value
         print("Training Configuration")
         print(cfg)
         train(
             config=cfg,
-            model_name=args.model,
+            model_name=model_name,
             data_root=args.data_root,
             labels_root=args.labels_root,
         )

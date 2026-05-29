@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 
 from dataset import load_data
 from config import config as base_config
-from models import Densenet121, EfficientNetB0
+from models import Densenet121, EfficientNetB0, EfficientNetB0ViT
 
 
 def _build_model(name: str):
@@ -26,6 +26,8 @@ def _build_model(name: str):
         return Densenet121()
     if name == "efficientnetb0":
         return EfficientNetB0()
+    if name in {"efficientnetb0_vit", "efficientnetb0-vit", "efficientnetb0vit"}:
+        return EfficientNetB0ViT()
     raise ValueError(f"Unsupported model: {name}")
 
 
@@ -67,7 +69,12 @@ def lr_finder(model, loader, criterion, device, lr_start, lr_end, num_iters):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", type=str, default="densenet121", choices=["densenet121", "efficientnetb0"])
+    ap.add_argument(
+        "--model",
+        type=str,
+        default="efficientnetb0_vit",
+        choices=["densenet121", "efficientnetb0", "efficientnetb0_vit", "efficientnetb0-vit", "efficientnetb0vit"],
+    )
     ap.add_argument("--lr-start", type=float, default=1e-6)
     ap.add_argument("--lr-end", type=float, default=1e-2)
     ap.add_argument("--iters", type=int, default=100)
